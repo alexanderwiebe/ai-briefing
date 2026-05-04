@@ -5,6 +5,7 @@ Long-polls getUpdates and dispatches echo:{section} button presses.
 """
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -14,6 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import URLError
+
+import otel
+from opentelemetry import trace
+
+log = logging.getLogger(__name__)
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -176,112 +182,113 @@ def render_note(item: dict, tags: list) -> str:
 # ── Callback handler ───────────────────────────────────────────────────────
 VALID_SECTIONS = {"act_now", "queue", "inform", "people"}
 
+tracer: trace.Tracer | None = None
+
 
 def handle_callback_query(token, chat_id, redis_host, cq):
     cq_id = cq["id"]
     data = cq.get("data", "")
     user = cq.get("from", {})
     username = user.get("username") or user.get("first_name", "unknown")
-    timestamp = datetime.now(timezone.utc).isoformat()
 
-    # Must answer within 10s or Telegram shows a permanent loading spinner
-    answer_callback_query(token, cq_id)
+    action = data.split(":")[0] if ":" in data else data
+    subject = data.split(":", 1)[1] if ":" in data else ""
 
-    if data.startswith("echo:"):
-        section_key = data[len("echo:"):]
-        if section_key not in VALID_SECTIONS:
-            send_message(token, chat_id, f"⚠️ Unknown section: <code>{section_key}</code>")
-            return
-        section_text, count = get_section_from_redis(section_key, redis_host)
-        if section_text is None:
-            send_message(token, chat_id,
-                f"⏳ <b>Section expired</b>\nThe <code>{section_key}</code> section "
-                f"is no longer in Redis (sections expire after 24h).")
-            print(f"[ECHO] Section {section_key!r} requested by {username!r} — key expired")
-            return
-        sep = "─" * 41
-        print(f"[ECHO] {sep}")
-        print(f"[ECHO] Section:  {section_key}")
-        print(f"[ECHO] User:     {username}")
-        print(f"[ECHO] Time:     {timestamp}")
-        print(f"[ECHO] Items:    {count}")
-        print(f"[ECHO] {sep}")
-        send_message(token, chat_id, section_text)
+    with tracer.start_as_current_span("bot.callback_query") as span:
+        span.set_attribute("callback.action", action)
+        span.set_attribute("callback.subject", subject)
+        span.set_attribute("user.name", username)
 
-    elif data.startswith("item:"):
-        item_id = data[len("item:"):]
-        item = get_item_from_redis(item_id, redis_host)
-        if item is None:
-            send_message(token, chat_id,
-                f"⏳ <b>Item expired</b>\nThis item is no longer in Redis (items expire after 24h).")
-            print(f"[ITEM] {item_id!r} requested by {username!r} — key expired")
-            return
-        sep = "─" * 41
-        print(f"[ITEM] {sep}")
-        print(f"[ITEM] ID:       {item_id}")
-        print(f"[ITEM] Section:  {item.get('section')}")
-        print(f"[ITEM] Index:    {item.get('index')}")
-        print(f"[ITEM] User:     {username}")
-        print(f"[ITEM] Time:     {timestamp}")
-        print(f"[ITEM] {sep}")
-        # Format item detail card
-        section = item.get("section", "")
-        if section == "people":
-            text = f"👤 <b>{item['handle']}</b>\n{item['reason']}"
-        else:
-            text = f"<b>{item['title']}</b>\n{item['summary']}"
-            if item.get("url"):
-                text += f'\n<a href="{item["url"]}">↗ Read more</a>'
-            if item.get("source"):
-                text += f"\n<i>{item['source']}</i>"
-        send_message(token, chat_id, text)
+        # Must answer within 10s or Telegram shows a permanent loading spinner
+        answer_callback_query(token, cq_id)
 
-    elif data.startswith("save:"):
-        item_id = data[len("save:"):]
-        item = get_item_from_redis(item_id, redis_host)
-        if item is None:
-            send_message(token, chat_id,
-                "⏳ <b>Item expired</b>\nThis item is no longer in Redis (items expire after 24h).")
-            print(f"[SAVE] {item_id!r} requested by {username!r} — key expired")
-            return
+        if data.startswith("echo:"):
+            section_key = subject
+            if section_key not in VALID_SECTIONS:
+                send_message(token, chat_id, f"⚠️ Unknown section: <code>{section_key}</code>")
+                return
+            section_text, count = get_section_from_redis(section_key, redis_host)
+            if section_text is None:
+                send_message(token, chat_id,
+                    f"⏳ <b>Section expired</b>\nThe <code>{section_key}</code> section "
+                    f"is no longer in Redis (sections expire after 24h).")
+                log.info("echo section=%s user=%s status=expired", section_key, username)
+                return
+            log.info("echo section=%s user=%s items=%d", section_key, username, count)
+            span.set_attribute("section.items", count)
+            send_message(token, chat_id, section_text)
 
-        try:
-            tags     = infer_tags(item)
-            raw      = item["handle"] if item.get("section") == "people" else item.get("title", item_id)
-            slug     = slugify(raw)
-            category = SECTION_CATEGORIES.get(item.get("section", "inform"), "reading")
-            filepath = f"{VAULT_BASE}/{category}/{slug}.md"
+        elif data.startswith("item:"):
+            item_id = subject
+            item = get_item_from_redis(item_id, redis_host)
+            if item is None:
+                send_message(token, chat_id,
+                    f"⏳ <b>Item expired</b>\nThis item is no longer in Redis (items expire after 24h).")
+                log.info("item id=%s user=%s status=expired", item_id, username)
+                return
+            log.info("item id=%s section=%s index=%s user=%s",
+                     item_id, item.get("section"), item.get("index"), username)
+            span.set_attribute("item.section", item.get("section", ""))
+            span.set_attribute("item.index", item.get("index", 0))
+            section = item.get("section", "")
+            if section == "people":
+                text = f"👤 <b>{item['handle']}</b>\n{item['reason']}"
+            else:
+                text = f"<b>{item['title']}</b>\n{item['summary']}"
+                if item.get("url"):
+                    text += f'\n<a href="{item["url"]}">↗ Read more</a>'
+                if item.get("source"):
+                    text += f"\n<i>{item['source']}</i>"
+            send_message(token, chat_id, text)
 
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
-            with open(filepath, "w") as f:
-                f.write(render_note(item, tags))
+        elif data.startswith("save:"):
+            item_id = subject
+            item = get_item_from_redis(item_id, redis_host)
+            if item is None:
+                send_message(token, chat_id,
+                    "⏳ <b>Item expired</b>\nThis item is no longer in Redis (items expire after 24h).")
+                log.info("save id=%s user=%s status=expired", item_id, username)
+                return
 
-            sep = "─" * 41
-            print(f"[SAVE] {sep}")
-            print(f"[SAVE] ID:       {item_id}")
-            print(f"[SAVE] File:     research/{category}/{slug}.md")
-            print(f"[SAVE] User:     {username}")
-            print(f"[SAVE] Time:     {timestamp}")
-            print(f"[SAVE] {sep}")
-            send_message(token, chat_id,
-                f"💾 Saved: <code>research/{category}/{slug}.md</code>")
-        except Exception as e:
-            print(f"[SAVE] ERROR for {item_id!r}: {e}", file=sys.stderr)
-            send_message(token, chat_id,
-                f"❌ <b>Save failed</b>\n<code>{e}</code>")
+            try:
+                with tracer.start_as_current_span("bot.save_note") as save_span:
+                    tags     = infer_tags(item)
+                    raw      = item["handle"] if item.get("section") == "people" else item.get("title", item_id)
+                    slug     = slugify(raw)
+                    category = SECTION_CATEGORIES.get(item.get("section", "inform"), "reading")
+                    filepath = f"{VAULT_BASE}/{category}/{slug}.md"
+                    save_span.set_attribute("note.category", category)
+                    save_span.set_attribute("note.slug", slug)
+
+                    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                    with open(filepath, "w") as f:
+                        f.write(render_note(item, tags))
+
+                log.info("save id=%s file=research/%s/%s.md user=%s", item_id, category, slug, username)
+                span.set_attribute("note.path", f"research/{category}/{slug}.md")
+                send_message(token, chat_id,
+                    f"💾 Saved: <code>research/{category}/{slug}.md</code>")
+            except Exception as e:
+                log.error("save failed id=%s error=%s", item_id, e)
+                span.record_exception(e)
+                span.set_status(trace.StatusCode.ERROR, str(e))
+                send_message(token, chat_id,
+                    f"❌ <b>Save failed</b>\n<code>{e}</code>")
 
 # ── Main polling loop ──────────────────────────────────────────────────────
 def main():
+    global tracer
+    tracer = otel.setup("ai-briefing-bot")
     env = load_env()
     token = env.get("TELEGRAM_TOKEN", "")
     chat_id = env.get("TELEGRAM_CHAT_ID", "")
     redis_host = env.get("REDIS_HOST", "localhost")
 
     if not token or not chat_id:
-        print("ERROR: TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set in .env", file=sys.stderr)
+        log.error("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set in .env")
         sys.exit(1)
 
-    print("[bot] Starting — long-polling for callback queries")
+    log.info("Starting — long-polling for callback queries")
 
     offset = 0
     while True:
@@ -293,7 +300,7 @@ def main():
                 if cq:
                     handle_callback_query(token, chat_id, redis_host, cq)
         except Exception as e:
-            print(f"[bot] Error: {e} — retrying in 5s", file=sys.stderr)
+            log.warning("Poll error: %s — retrying in 5s", e)
             time.sleep(5)
 
 

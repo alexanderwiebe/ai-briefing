@@ -7,6 +7,7 @@ delivers via Telegram.
 
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -20,6 +21,11 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
 from urllib.error import URLError
+
+import otel
+from opentelemetry import trace
+
+log = logging.getLogger(__name__)
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -129,7 +135,7 @@ def fetch_feed(url):
             })
         return url, items
     except Exception as e:
-        print(f"  [warn] Failed to fetch {url}: {e}", file=sys.stderr)
+        log.warning("Failed to fetch %s: %s", url, e)
         return url, []
 
 def fetch_all_feeds(since: datetime):
@@ -404,68 +410,103 @@ def send_telegram(token, chat_id, text, reply_markup=None):
     return errors
 
 # ── Main ───────────────────────────────────────────────────────────────────
+MAX_POSTS = 50
+
 def main():
+    tracer = otel.setup("ai-briefing")
     env = load_env()
     token = env.get("TELEGRAM_TOKEN", "")
     chat_id = env.get("TELEGRAM_CHAT_ID", "")
     redis_host = env.get("REDIS_HOST", "localhost")
 
     if not token or not chat_id:
-        print("ERROR: TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set in .env", file=sys.stderr)
+        log.error("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set in .env")
+        otel.shutdown()
         sys.exit(1)
 
-    state = load_state()
-    window_start = get_window_start(state)
-    window_end = datetime.now(timezone.utc)
+    try:
+        with tracer.start_as_current_span("briefing.run") as root_span:
+            try:
+                state = load_state()
+                window_start = get_window_start(state)
+                window_end = datetime.now(timezone.utc)
+                root_span.set_attribute("window.start", window_start.isoformat())
+                root_span.set_attribute("window.end", window_end.isoformat())
 
-    print(f"Fetching posts from {window_start.strftime('%Y-%m-%d %H:%M UTC')} → {window_end.strftime('%Y-%m-%d %H:%M UTC')}")
+                log.info("Fetching posts %s → %s",
+                         window_start.strftime('%Y-%m-%d %H:%M UTC'),
+                         window_end.strftime('%Y-%m-%d %H:%M UTC'))
 
-    items = fetch_all_feeds(window_start)
-    print(f"Found {len(items)} unique posts after deduplication")
+                with tracer.start_as_current_span("briefing.fetch_feeds") as fetch_span:
+                    items = fetch_all_feeds(window_start)
+                    fetch_span.set_attribute("posts.fetched", len(items))
 
-    # Cap to avoid prompt size blowing the Claude timeout; keep the most recent.
-    MAX_POSTS = 50
-    if len(items) > MAX_POSTS:
-        print(f"Capping to {MAX_POSTS} most recent posts (dropped {len(items) - MAX_POSTS})")
-        items = items[-MAX_POSTS:]
+                log.info("Found %d unique posts after deduplication", len(items))
 
-    if not items:
-        msg = f"📭 AI Briefing — {window_end.strftime('%a %d %b %H:%M')}\nNo new posts since {window_start.strftime('%H:%M')}."
-        send_telegram(token, chat_id, msg)
-        save_state({"last_run": window_end.isoformat()})
-        return
+                if len(items) > MAX_POSTS:
+                    log.info("Capping to %d most recent posts (dropped %d)", MAX_POSTS, len(items) - MAX_POSTS)
+                    items = items[-MAX_POSTS:]
 
-    top_rt, top_mentions = extract_mentioned_accounts(items)
-    following = load_following()
-    posts_text = format_posts_for_claude(items, top_rt, top_mentions, window_start, window_end, following)
+                root_span.set_attribute("posts.count", len(items))
 
-    print(f"Sending {len(items)} posts to Claude for classification...")
-    report, error = run_claude(posts_text)
+                if not items:
+                    msg = f"📭 AI Briefing — {window_end.strftime('%a %d %b %H:%M')}\nNo new posts since {window_start.strftime('%H:%M')}."
+                    send_telegram(token, chat_id, msg)
+                    save_state({"last_run": window_end.isoformat()})
+                    return
 
-    if error:
-        print(f"ERROR: {error}", file=sys.stderr)
-        send_telegram(token, chat_id, f"⚠️ AI Briefing failed: {error}")
-        sys.exit(1)
+                top_rt, top_mentions = extract_mentioned_accounts(items)
+                following = load_following()
+                posts_text = format_posts_for_claude(items, top_rt, top_mentions, window_start, window_end, following)
 
-    timestamp = window_end.strftime('%a %d %b, %H:%M')
-    sections, parse_error = parse_claude_json(report)
+                log.info("Sending %d posts to Claude for classification", len(items))
+                with tracer.start_as_current_span("briefing.classify") as classify_span:
+                    classify_span.set_attribute("posts.count", len(items))
+                    report, error = run_claude(posts_text)
+                    if error:
+                        classify_span.set_status(trace.StatusCode.ERROR, error)
 
-    print("Sending to Telegram...")
-    if parse_error:
-        print(f"[warn] JSON parse failed ({parse_error}), sending raw output", file=sys.stderr)
-        fallback = f"<b>AI Briefing — {timestamp}</b> ({len(items)} posts)\n\n{report}"
-        errors = send_telegram(token, chat_id, fallback)
-    else:
-        store_in_redis(sections, redis_host)
-        errors = []
-        send_briefing(token, chat_id, sections, timestamp, len(items))
+                if error:
+                    log.error("Claude classification failed: %s", error)
+                    send_telegram(token, chat_id, f"⚠️ AI Briefing failed: {error}")
+                    root_span.set_status(trace.StatusCode.ERROR, error)
+                    sys.exit(1)
 
-    if errors:
-        print(f"Telegram errors: {errors}", file=sys.stderr)
-    else:
-        print("Delivered successfully.")
+                timestamp = window_end.strftime('%a %d %b, %H:%M')
+                sections, parse_error = parse_claude_json(report)
 
-    save_state({"last_run": window_end.isoformat()})
+                log.info("Sending briefing to Telegram")
+                with tracer.start_as_current_span("briefing.deliver") as deliver_span:
+                    if parse_error:
+                        log.warning("JSON parse failed (%s), sending raw output", parse_error)
+                        fallback = f"<b>AI Briefing — {timestamp}</b> ({len(items)} posts)\n\n{report}"
+                        errors = send_telegram(token, chat_id, fallback)
+                    else:
+                        store_in_redis(sections, redis_host)
+                        errors = []
+                        send_briefing(token, chat_id, sections, timestamp, len(items))
+                        delivered = sum(len(sections.get(k, [])) for k in ("act_now", "queue", "inform", "people"))
+                        deliver_span.set_attribute("items.delivered", delivered)
+                        for k in ("act_now", "queue", "inform", "people"):
+                            deliver_span.set_attribute(f"section.{k}", len(sections.get(k, [])))
+                    if errors:
+                        deliver_span.set_attribute("telegram.errors", len(errors))
+
+                if errors:
+                    log.warning("Telegram errors: %s", errors)
+                else:
+                    log.info("Delivered successfully")
+
+                save_state({"last_run": window_end.isoformat()})
+
+            except SystemExit:
+                raise
+            except Exception as e:
+                root_span.record_exception(e)
+                root_span.set_status(trace.StatusCode.ERROR, str(e))
+                raise
+    finally:
+        otel.shutdown()
 
 if __name__ == "__main__":
     main()
