@@ -197,44 +197,14 @@ def extract_mentioned_accounts(items):
 
     return top_rt, top_mentions
 
-# ── Format posts for Claude ────────────────────────────────────────────────
-def format_posts_for_claude(items, top_rt, top_mentions, window_start, window_end, following=None):
-    lines = []
-    lines.append(f"Window: {window_start.strftime('%Y-%m-%d %H:%M UTC')} → {window_end.strftime('%Y-%m-%d %H:%M UTC')}")
-    lines.append(f"Total posts: {len(items)}\n")
-
-    for i, item in enumerate(items, 1):
-        lines.append(f"[{i}] @{item['author']} | {item['published'].strftime('%H:%M UTC')}")
-        lines.append(f"    {item['desc'][:400]}")
-        lines.append(f"    {item['link']}")
-        lines.append("")
-
-    lines.append("---")
-    lines.append("FREQUENTLY RT'd (display name, count):")
-    for name, count in top_rt:
-        lines.append(f"  {name} ({count}x)")
-
-    lines.append("\nFREQUENTLY MENTIONED (@handle, count):")
-    for handle, count in top_mentions[:10]:
-        lines.append(f"  @{handle} ({count}x)")
-
-    if following:
-        lines.append("\nALREADY FOLLOWING (exclude from PEOPLE TO FOLLOW):")
-        for handle in sorted(following):
-            lines.append(f"  @{handle}")
-
-    return "\n".join(lines)
-
 # ── Claude CLI invocation ──────────────────────────────────────────────────
-CLASSIFICATION_PROMPT = """You are preparing an AI industry briefing for a principal consultant who leads a team of consultants. Your job is to classify and summarise recent posts from AI industry figures on Twitter/X.
+BATCH_PROMPT = """You are preparing an AI industry briefing for a principal consultant who leads a team of consultants. Classify and summarise this batch of recent posts from AI industry figures on Twitter/X.
 
 CLASSIFICATION QUADRANTS:
 - ACT NOW: Actionable AND Important. New tool/feature/release available today, significant capability change, something the consultant or their team can adopt immediately. Must be concrete and usable.
 - QUEUE: Actionable but less urgent. Worth evaluating, minor updates, useful techniques that don't need immediate attention.
 - INFORM: Not directly actionable but important for strategic awareness. Industry trends, research findings, CEO/leader statements about AI's direction, things clients will ask about.
 - SKIP: Not actionable, not strategically important. Memes, politics, social commentary, personal posts unrelated to AI practice.
-
-PEOPLE TO FOLLOW: From the RT and mention data provided, recommend 3-5 accounts worth following. Prioritise people sharing original tools, research, or practitioner insights — not just commentators. You will be given an ALREADY FOLLOWING list — do NOT recommend any account on that list.
 
 OUTPUT FORMAT: respond with a single JSON code block and nothing else.
 
@@ -243,7 +213,6 @@ OUTPUT FORMAT: respond with a single JSON code block and nothing else.
   "act_now": [{{"title": "...", "summary": "1-2 sentence summary", "url": "...", "source": "@handle"}}],
   "queue":   [{{"title": "...", "summary": "1-2 sentence summary", "url": "...", "source": "@handle"}}],
   "inform":  [{{"title": "...", "summary": "1-2 sentence summary", "url": "...", "source": "@handle"}}],
-  "people":  [{{"handle": "@...", "reason": "one line on why"}}],
   "skip":    {{"count": 0}}
 }}
 ```
@@ -255,14 +224,31 @@ Here are the posts to classify:
 {posts}
 """
 
-def run_claude(posts_text):
-    prompt = CLASSIFICATION_PROMPT.format(posts=posts_text)
+PEOPLE_PROMPT = """You are preparing an AI industry briefing for a principal consultant. Based on the RT and mention frequency data below, recommend 3-5 accounts worth following. Prioritise people sharing original tools, research, or practitioner insights — not just commentators. Do NOT recommend any account in the ALREADY FOLLOWING list.
+
+OUTPUT FORMAT: respond with a single JSON code block and nothing else.
+
+```json
+{{
+  "people": [{{"handle": "@...", "reason": "one line on why"}}]
+}}
+```
+
+{context}
+"""
+
+CLAUDE_TIMEOUT = 120  # per-batch; well within range for ~15 posts
+BATCH_SIZE = 15
+
+
+def _call_claude(prompt):
+    """Invoke `claude -p` and return (stdout, error_string)."""
     try:
         result = subprocess.run(
             ['claude', '-p', prompt],
             capture_output=True,
             text=True,
-            timeout=270,
+            timeout=CLAUDE_TIMEOUT,
             env={**os.environ, 'TERM': 'dumb'},
         )
         if result.returncode != 0:
@@ -273,32 +259,108 @@ def run_claude(posts_text):
             return None, "Claude CLI returned empty output"
         return output, None
     except subprocess.TimeoutExpired:
-        return None, "Claude CLI timed out after 270s"
+        return None, f"Claude CLI timed out after {CLAUDE_TIMEOUT}s"
     except FileNotFoundError:
         return None, "claude CLI not found in PATH"
 
-# ── Parse Claude JSON output ──────────────────────────────────────────────
-def parse_claude_json(text):
-    """Extract JSON from Claude's response, assign index and id to each item."""
+
+def _format_batch(items):
+    lines = [f"Total posts in batch: {len(items)}\n"]
+    for i, item in enumerate(items, 1):
+        lines.append(f"[{i}] @{item['author']} | {item['published'].strftime('%H:%M UTC')}")
+        lines.append(f"    {item['desc'][:400]}")
+        lines.append(f"    {item['link']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _extract_batch_json(text):
+    """Pull the JSON object out of a batch response (no 'people' key expected)."""
     m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
     raw = m.group(1) if m else text.strip()
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
         return None, f"JSON decode error: {e}"
+    for key in ("act_now", "queue", "inform"):
+        if key not in data:
+            data[key] = []
+    return data, None
 
+
+def classify_in_batches(items, top_rt, top_mentions, following, tracer):
+    """
+    Classify posts in batches of BATCH_SIZE, then fetch PEOPLE TO FOLLOW
+    in a final lightweight call. Returns (merged_data, error_string).
+    """
+    merged = {"act_now": [], "queue": [], "inform": [], "skip": {"count": 0}}
+
+    batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
+    log.info("Classifying %d posts in %d batches (size %d)", len(items), len(batches), BATCH_SIZE)
+
+    for idx, batch in enumerate(batches, 1):
+        with tracer.start_as_current_span("briefing.classify_batch") as span:
+            span.set_attribute("batch.index", idx)
+            span.set_attribute("batch.size", len(batch))
+            log.info("Batch %d/%d: %d posts", idx, len(batches), len(batch))
+
+            prompt = BATCH_PROMPT.format(posts=_format_batch(batch))
+            output, error = _call_claude(prompt)
+            if error:
+                span.set_status(trace.StatusCode.ERROR, error)
+                return None, f"Batch {idx}/{len(batches)} failed: {error}"
+
+            data, parse_error = _extract_batch_json(output)
+            if parse_error:
+                span.set_status(trace.StatusCode.ERROR, parse_error)
+                return None, f"Batch {idx}/{len(batches)} parse error: {parse_error}"
+
+            for key in ("act_now", "queue", "inform"):
+                merged[key].extend(data.get(key, []))
+            merged["skip"]["count"] += data.get("skip", {}).get("count", 0)
+
+    # People-to-follow as a separate lightweight call
+    with tracer.start_as_current_span("briefing.classify_people") as span:
+        context_lines = []
+        context_lines.append("FREQUENTLY RT'd (display name, count):")
+        for name, count in top_rt:
+            context_lines.append(f"  {name} ({count}x)")
+        context_lines.append("\nFREQUENTLY MENTIONED (@handle, count):")
+        for handle, count in top_mentions[:10]:
+            context_lines.append(f"  @{handle} ({count}x)")
+        if following:
+            context_lines.append("\nALREADY FOLLOWING (exclude from recommendations):")
+            for handle in sorted(following):
+                context_lines.append(f"  @{handle}")
+
+        prompt = PEOPLE_PROMPT.format(context="\n".join(context_lines))
+        output, error = _call_claude(prompt)
+        if error:
+            span.set_status(trace.StatusCode.ERROR, error)
+            log.warning("People-to-follow call failed: %s — omitting section", error)
+            merged["people"] = []
+        else:
+            m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', output, re.DOTALL)
+            raw = m.group(1) if m else output.strip()
+            try:
+                merged["people"] = json.loads(raw).get("people", [])
+            except json.JSONDecodeError:
+                log.warning("People JSON parse failed — omitting section")
+                merged["people"] = []
+
+    # Stamp section, index, and stable id onto every item
     for section_key in ("act_now", "queue", "inform"):
-        for idx, item in enumerate(data.get(section_key, []), 1):
+        for idx, item in enumerate(merged.get(section_key, []), 1):
             item["section"] = section_key
             item["index"] = idx
             key_str = (item.get("url") or item.get("title") or "") + str(idx)
             item["id"] = "item_" + hashlib.sha1(key_str.encode()).hexdigest()[:8]
-    for idx, item in enumerate(data.get("people", []), 1):
+    for idx, item in enumerate(merged.get("people", []), 1):
         item["section"] = "people"
         item["index"] = idx
         item["id"] = "item_" + hashlib.sha1((item.get("handle", "") + str(idx)).encode()).hexdigest()[:8]
 
-    return data, None
+    return merged, None
 
 
 # ── Redis item storage ─────────────────────────────────────────────────────
@@ -457,14 +519,9 @@ def main():
 
                 top_rt, top_mentions = extract_mentioned_accounts(items)
                 following = load_following()
-                posts_text = format_posts_for_claude(items, top_rt, top_mentions, window_start, window_end, following)
 
                 log.info("Sending %d posts to Claude for classification", len(items))
-                with tracer.start_as_current_span("briefing.classify") as classify_span:
-                    classify_span.set_attribute("posts.count", len(items))
-                    report, error = run_claude(posts_text)
-                    if error:
-                        classify_span.set_status(trace.StatusCode.ERROR, error)
+                sections, error = classify_in_batches(items, top_rt, top_mentions, following, tracer)
 
                 if error:
                     log.error("Claude classification failed: %s", error)
@@ -473,22 +530,16 @@ def main():
                     sys.exit(1)
 
                 timestamp = window_end.strftime('%a %d %b, %H:%M')
-                sections, parse_error = parse_claude_json(report)
 
                 log.info("Sending briefing to Telegram")
                 with tracer.start_as_current_span("briefing.deliver") as deliver_span:
-                    if parse_error:
-                        log.warning("JSON parse failed (%s), sending raw output", parse_error)
-                        fallback = f"<b>AI Briefing — {timestamp}</b> ({len(items)} posts)\n\n{report}"
-                        errors = send_telegram(token, chat_id, fallback)
-                    else:
-                        store_in_redis(sections, redis_host)
-                        errors = []
-                        send_briefing(token, chat_id, sections, timestamp, len(items))
-                        delivered = sum(len(sections.get(k, [])) for k in ("act_now", "queue", "inform", "people"))
-                        deliver_span.set_attribute("items.delivered", delivered)
-                        for k in ("act_now", "queue", "inform", "people"):
-                            deliver_span.set_attribute(f"section.{k}", len(sections.get(k, [])))
+                    store_in_redis(sections, redis_host)
+                    errors = []
+                    send_briefing(token, chat_id, sections, timestamp, len(items))
+                    delivered = sum(len(sections.get(k, [])) for k in ("act_now", "queue", "inform", "people"))
+                    deliver_span.set_attribute("items.delivered", delivered)
+                    for k in ("act_now", "queue", "inform", "people"):
+                        deliver_span.set_attribute(f"section.{k}", len(sections.get(k, [])))
                     if errors:
                         deliver_span.set_attribute("telegram.errors", len(errors))
 
