@@ -228,6 +228,8 @@ def log_classified_tweets(items: list, sections: dict) -> None:
                 "tweet_id": _extract_tweet_id(url or raw.get('link', '') or raw.get('guid', '')),
                 "author": classified.get('source', raw.get('author', '')),
                 "text_preview": text[:200],
+                "title": classified.get('title', ''),
+                "summary": classified.get('summary', ''),
                 "url": url,
                 "classification": section_key,
                 "token_estimate": len(text) // 4,
