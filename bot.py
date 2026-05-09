@@ -257,12 +257,16 @@ def handle_callback_query(token, chat_id, redis_host, cq):
                     slug     = slugify(raw)
                     category = SECTION_CATEGORIES.get(item.get("section", "inform"), "reading")
                     filepath = f"{VAULT_BASE}/{category}/{slug}.md"
+                    note     = render_note(item, tags)
                     save_span.set_attribute("note.category", category)
                     save_span.set_attribute("note.slug", slug)
+                    save_span.set_attribute("obsidian.file_path", filepath)
+                    save_span.set_attribute("obsidian.note_length", len(note))
+                    save_span.set_attribute("pipeline.stage", "save")
 
                     os.makedirs(os.path.dirname(filepath), exist_ok=True)
                     with open(filepath, "w") as f:
-                        f.write(render_note(item, tags))
+                        f.write(note)
 
                 log.info("save id=%s file=research/%s/%s.md user=%s", item_id, category, slug, username)
                 span.set_attribute("note.path", f"research/{category}/{slug}.md")

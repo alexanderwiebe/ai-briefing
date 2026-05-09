@@ -238,6 +238,7 @@ OUTPUT FORMAT: respond with a single JSON code block and nothing else.
 """
 
 CLAUDE_TIMEOUT = 120  # per-batch; well within range for ~15 posts
+CLAUDE_MODEL = "claude-sonnet"
 BATCH_SIZE = 15
 
 
@@ -302,6 +303,11 @@ def classify_in_batches(items, top_rt, top_mentions, following, tracer):
         with tracer.start_as_current_span("briefing.classify_batch") as span:
             span.set_attribute("batch.index", idx)
             span.set_attribute("batch.size", len(batch))
+            span.set_attribute("tweet.count", len(batch))
+            span.set_attribute("tweet.ids", ",".join(item.get("guid", "") for item in batch))
+            span.set_attribute("classification.model", CLAUDE_MODEL)
+            span.set_attribute("classification.timeout_sec", CLAUDE_TIMEOUT)
+            span.set_attribute("pipeline.stage", "classification")
             log.info("Batch %d/%d: %d posts", idx, len(batches), len(batch))
 
             prompt = BATCH_PROMPT.format(posts=_format_batch(batch))
@@ -502,6 +508,7 @@ def main():
                 with tracer.start_as_current_span("briefing.fetch_feeds") as fetch_span:
                     items = fetch_all_feeds(window_start)
                     fetch_span.set_attribute("posts.fetched", len(items))
+                    fetch_span.set_attribute("pipeline.stage", "fetch")
 
                 log.info("Found %d unique posts after deduplication", len(items))
 
@@ -533,6 +540,7 @@ def main():
 
                 log.info("Sending briefing to Telegram")
                 with tracer.start_as_current_span("briefing.deliver") as deliver_span:
+                    deliver_span.set_attribute("pipeline.stage", "deliver")
                     store_in_redis(sections, redis_host)
                     errors = []
                     send_briefing(token, chat_id, sections, timestamp, len(items))
