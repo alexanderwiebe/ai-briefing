@@ -197,6 +197,60 @@ def extract_mentioned_accounts(items):
 
     return top_rt, top_mentions
 
+# ── Tweet-level Loki logging ───────────────────────────────────────────────
+def _extract_tweet_id(url: str) -> str:
+    m = re.search(r'/status/(\d+)', url or '')
+    return m.group(1) if m else ''
+
+
+def log_classified_tweets(items: list, sections: dict) -> None:
+    """Emit one structured log entry per source tweet with its classification.
+
+    Classified items are URL-matched back to their raw feed entry so we capture
+    the original tweet text rather than Claude's reformulation.  Anything Claude
+    didn't surface (SKIPs) is logged with classification='skip'.
+    """
+    span = trace.get_current_span()
+    ctx = span.get_span_context()
+    trace_id = format(ctx.trace_id, '032x') if ctx.is_valid else ""
+
+    by_url = {item['link']: item for item in items if item.get('link')}
+    logged_urls: set = set()
+
+    for section_key in ("act_now", "queue", "inform"):
+        for classified in sections.get(section_key, []):
+            url = classified.get('url', '')
+            raw = by_url.get(url, {})
+            text = raw.get('desc', '') or classified.get('title', '')
+            log.info("%s", json.dumps({
+                "event": "source_tweet",
+                "trace_id": trace_id,
+                "tweet_id": _extract_tweet_id(url or raw.get('link', '') or raw.get('guid', '')),
+                "author": classified.get('source', raw.get('author', '')),
+                "text_preview": text[:200],
+                "url": url,
+                "classification": section_key,
+                "token_estimate": len(text) // 4,
+            }))
+            if url:
+                logged_urls.add(url)
+
+    for item in items:
+        if item.get('link') in logged_urls:
+            continue
+        text = item.get('desc', '')
+        log.info("%s", json.dumps({
+            "event": "source_tweet",
+            "trace_id": trace_id,
+            "tweet_id": _extract_tweet_id(item.get('link', '') or item.get('guid', '')),
+            "author": item.get('author', ''),
+            "text_preview": text[:200],
+            "url": item.get('link', ''),
+            "classification": "skip",
+            "token_estimate": len(text) // 4,
+        }))
+
+
 # ── Claude CLI invocation ──────────────────────────────────────────────────
 BATCH_PROMPT = """You are preparing an AI industry briefing for a principal consultant who leads a team of consultants. Classify and summarise this batch of recent posts from AI industry figures on Twitter/X.
 
@@ -536,6 +590,7 @@ def main():
                     root_span.set_status(trace.StatusCode.ERROR, error)
                     sys.exit(1)
 
+                log_classified_tweets(items, sections)
                 timestamp = window_end.strftime('%a %d %b, %H:%M')
 
                 log.info("Sending briefing to Telegram")
