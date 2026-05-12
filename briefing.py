@@ -296,6 +296,7 @@ OUTPUT FORMAT: respond with a single JSON code block and nothing else.
 CLAUDE_TIMEOUT = 120  # per-batch; well within range for ~15 posts
 CLAUDE_MODEL = "claude-sonnet"
 BATCH_SIZE = 15
+BATCH_MAX_RETRIES = 2
 
 
 def _call_claude(prompt):
@@ -367,15 +368,23 @@ def classify_in_batches(items, top_rt, top_mentions, following, tracer):
             log.info("Batch %d/%d: %d posts", idx, len(batches), len(batch))
 
             prompt = BATCH_PROMPT.format(posts=_format_batch(batch))
-            output, error = _call_claude(prompt)
-            if error:
-                span.set_status(trace.StatusCode.ERROR, error)
-                return None, f"Batch {idx}/{len(batches)} failed: {error}"
-
-            data, parse_error = _extract_batch_json(output)
-            if parse_error:
-                span.set_status(trace.StatusCode.ERROR, parse_error)
-                return None, f"Batch {idx}/{len(batches)} parse error: {parse_error}"
+            data, last_error = None, None
+            for attempt in range(1, BATCH_MAX_RETRIES + 2):
+                output, error = _call_claude(prompt)
+                if error:
+                    last_error = f"Batch {idx}/{len(batches)} failed: {error}"
+                    log.warning("Batch %d attempt %d error: %s", idx, attempt, error)
+                    continue
+                data, parse_error = _extract_batch_json(output)
+                if parse_error:
+                    last_error = f"Batch {idx}/{len(batches)} parse error: {parse_error}"
+                    log.warning("Batch %d attempt %d parse error: %s", idx, attempt, parse_error)
+                    continue
+                last_error = None
+                break
+            if last_error:
+                span.set_status(trace.StatusCode.ERROR, last_error)
+                return None, last_error
 
             for key in ("act_now", "queue", "inform"):
                 merged[key].extend(data.get(key, []))
